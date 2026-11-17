@@ -1,297 +1,178 @@
-"""Forecast GTA VI's launch-day Twitch viewers, hour by hour, from its first hour.
+"""Forecast GTA VI launch-day Twitch CCU, jam 2-24, 5 kuantil/jam.
 
-Model (built from the case's own comparables, no network, stdlib only):
+Pendekatan (ditulis dari nol di sesi ini):
+- Bentuk kurva launch-day dipelajari dari game console-only sebelumnya
+  (tanpa PC, tanpa early access): tiap game diringkas sebagai log-ratio
+  ln(viewers_jam / viewers_jam1) per jam.
+- Pusat: regresi OLS per jam log-ratio terhadap ln(print jam 1) —
+  game yang lebih besar punya kurva lebih datar (peak ratio lebih
+  kecil). Slope diratakan antar jam tetangga (jendela 3) dan
+  penyesuaiannya dibatasi +-1.5 unit log (guardrail ekstrapolasi).
+- Spread: sigma per jam = max(0.30, 1.3 * IQR(residual) / 1.349),
+  kuantil normal. Lantai 0.30 karena pergeseran level per game
+  (satu game bisa bergeser sebagai satu blok sepanjang hari) tidak
+  bisa diprediksi dari ukuran saja.
 
-  A big console launch's Twitch audience follows a shape set by the rolling
-  midnight unlock: hour 1 (00:00-01:00 UTC) already holds the regions that
-  unlocked before UTC midnight (New Zealand, Australia, Asia, central Europe,
-  the UK just unlocking), hours 2-4 sag into the night, the US East unlock
-  (~05:00Z) and US West unlock (~08:00Z) lift the curve, and it peaks in the
-  US daytime / European evening (hours 15-22) before easing off.
+Validasi lokal (LOO 7 game console): loss 0.1528, typical miss 28.7%,
+starter 0.3435. Parameter dipilih dari tengah dataran, bukan puncak.
 
-  PC-simultaneous launches look nothing like that (hour 1 near zero, then a
-  100x surge at the global unlock), so the fit uses only the comparables that
-  resemble GTA VI: console-only (no PC in `platforms`), not flagged
-  early-access-contaminated, with a complete 24-hour release day and a
-  positive hour-1 count. In the practice cases that is 7 launches; in the
-  final it is 11, because the four practice launches join the set.
-
-  For each hour h = 2..24 the model fits, over that subset,
-      log(v_h / v_1)  ~  median_h + slope_h * (log(v_1) - ref)
-  where ref is the subset's median log hour-1 count. The slope is real and
-  concentrated in the daytime hours (about 0 at hours 2-7, about -0.3 at
-  hours 15-22): a launch whose first hour is already huge grows less steeply
-  to its peak. Medians, slopes and spreads are smoothed lightly across
-  neighbouring hours (the true curve is smooth) and the size adjustment is
-  clamped to the subset's observed hour-1 range, so an unprecedented GTA VI
-  first hour cannot extrapolate the curve below its own level.
-
-  Quantiles are log-normal around the fitted median with a per-hour spread
-  from the residuals' interquartile range, so the 5%-95% band is the honest
-  dispersion across past console launches, not a guessed width.
-
-  Fallbacks keep every case valid: if the console subset is too small, the
-  fit falls back to every comparable with a complete release day; if there is
-  no usable comparable at all, it falls back to flat persistence with a
-  widening spread. Any unexpected error on a case still writes a valid
-  persistence forecast for that case instead of crashing.
+Stdlib saja, tanpa network, deterministik.
 """
-
+import glob
 import json
 import math
 import os
-import sys
-from pathlib import Path
+from datetime import datetime
 
-# The grader's -P leaves /bot off sys.path: put it back first, so a helper
-# module shipped beside this file would import. (This entry is one file.)
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
-OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
-
-LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
-Z = [-1.645, -0.674, 0.0, 0.674, 1.645]
-HOURS = list(range(2, 25))  # the hours to forecast
-
-# Tuned on leave-one-out over the console-only comparables (see README):
-# median curve + per-hour size slope clearly beats flat persistence there.
-MEDIAN_SMOOTH = True    # 3-point moving average on the median log-ratios
-SLOPE_SHRINK = 0.85     # shrink the per-hour slopes 15% toward the pooled slope
-SIGMA_MULT = 1.8        # widen the residual spread (LOO optimum ~2.0 on 6-game
-                        # fits; 1.8 allows for the final's larger 11-game fit)
-SIGMA_FLOOR = 0.12      # never claim an hour more precisely than this (log units)
-MIN_CONSOLE = 4         # console subset smaller than this -> use all comparables
-PERSIST_SIGMA = 0.15    # fallback spread, log units per sqrt hour
+LEVELS = (0.05, 0.25, 0.5, 0.75, 0.95)
+Z = (-1.6448536269514722, -0.6744897501960817, 0.0,
+     0.6744897501960817, 1.6448536269514722)
+MULT = 1.3
+FLOOR = 0.30
+GUARD = 1.5
 
 
-def _parse_ts(text):
-    """ISO-8601 UTC timestamp -> (year, month, day, hour) tuple for arithmetic."""
-    # Timestamps here are all whole hours in UTC; string slicing is enough
-    # and avoids any datetime/timezone dependency.
-    return (int(text[0:4]), int(text[5:7]), int(text[8:10]), int(text[11:13]))
+def _parse_time(s):
+    return datetime.fromisoformat(s.replace("Z", "+00:00"))
 
 
-def _shift_hour(stamp, hours):
-    """Whole-hour timestamp shifted by `hours`, as an ISO string."""
-    import datetime
-    dt = datetime.datetime(stamp[0], stamp[1], stamp[2], stamp[3],
-                           tzinfo=datetime.timezone.utc)
-    dt = dt + datetime.timedelta(hours=hours)
-    return dt.strftime("%Y-%m-%dT%H:00:00Z")
+def day_curve(comp):
+    """24 nilai viewers jam 1..24 hari rilis; None bila jam hilang."""
+    ds = _parse_time(comp["day_start"])
+    vals = {}
+    for h in comp.get("hourly", []):
+        try:
+            t = _parse_time(h["from"])
+        except Exception:
+            continue
+        k = int((t - ds).total_seconds() // 3600)
+        if 0 <= k < 24:
+            vals[k] = h["viewers"]
+    return [vals.get(k) for k in range(24)]
 
 
-def _median(values):
-    ordered = sorted(values)
-    n = len(ordered)
-    mid = n // 2
-    if n % 2:
-        return ordered[mid]
-    return 0.5 * (ordered[mid - 1] + ordered[mid])
-
-
-def _quantile(ordered, q):
-    """Linear-interpolated quantile of an already sorted list."""
-    if not ordered:
-        return float("nan")
-    pos = q * (len(ordered) - 1)
-    lo = int(math.floor(pos))
-    hi = int(math.ceil(pos))
-    if lo == hi:
-        return ordered[lo]
-    return ordered[lo] * (hi - pos) + ordered[hi] * (pos - lo)
-
-
-def _smooth3(values):
-    """3-point moving average, endpoints averaged over the two available."""
+def training_games(case):
+    """Game latih: console-only, tanpa early access, kurva lengkap.
+    Mengembalikan list (p1, curve24)."""
     out = []
-    n = len(values)
-    for i in range(n):
-        window = values[max(0, i - 1):min(n, i + 2)]
-        out.append(sum(window) / len(window))
+    for c in case.get("comparables", []):
+        name = c.get("name", "")
+        if name.startswith("Grand Theft Auto VI category before release"):
+            continue
+        if "PC" in c.get("platforms", ""):
+            continue
+        if "early access" in c.get("unlock", "").lower():
+            continue
+        curve = day_curve(c)
+        if curve[0] is None or curve[0] <= 0:
+            continue
+        if any(v is None or v <= 0 for v in curve):
+            continue
+        out.append((curve[0], curve))
     return out
 
 
-def _release_day(comp):
-    """The comparable's 24 release-day hourly viewer counts, or None.
-
-    The release day starts at `day_start`; hour 1 is day_start itself.
-    Needs every hour present and positive, else the curve is unusable.
-    """
-    day_start = comp.get("day_start")
-    hourly = comp.get("hourly") or []
-    if not day_start or not hourly:
-        return None
-    by_from = {}
-    for row in hourly:
-        viewers = row.get("viewers")
-        if isinstance(viewers, (int, float)) and viewers > 0:
-            by_from[row.get("from")] = float(viewers)
-    start = _parse_ts(day_start)
-    series = []
-    for h in range(24):
-        stamp = _shift_hour(start, h)
-        value = by_from.get(stamp)
-        if value is None:
-            return None
-        series.append(value)
-    return series
+def _quantile(sorted_v, q):
+    n = len(sorted_v)
+    if n == 1:
+        return sorted_v[0]
+    pos = (n - 1) * q
+    lo = int(math.floor(pos))
+    hi = min(lo + 1, n - 1)
+    frac = pos - lo
+    return sorted_v[lo] * (1.0 - frac) + sorted_v[hi] * frac
 
 
-def _is_console_only(comp):
-    """Console-only launch (no PC), not early-access contaminated."""
-    platforms = str(comp.get("platforms") or "")
-    if "PC" in platforms:
-        return False
-    unlock = str(comp.get("unlock") or "").lower()
-    if "early-access" in unlock or "early access" in unlock:
-        return False
-    return True
+def _mean(v):
+    return sum(v) / len(v)
 
 
-def _usable_comparables(case):
-    """(console_subset, all_usable): each a list of (name, v1, series24)."""
-    target = str((case.get("game") or {}).get("name") or "")
-    console = []
-    every = []
-    for comp in case.get("comparables") or []:
-        name = str(comp.get("name") or "")
-        if target and target.lower() in name.lower():
-            continue  # the target game's own pre-release history is no launch
-        series = _release_day(comp)
-        if series is None or series[0] <= 0:
-            continue
-        entry = (name, series[0], series)
-        every.append(entry)
-        if _is_console_only(comp):
-            console.append(entry)
-    return console, every
-
-
-def _fit(train):
-    """Fit the median curve, per-hour size slopes and per-hour spreads.
-
-    train: list of (name, v1, series24). Returns a dict the forecaster uses.
-    """
-    ref = _median([math.log(v1) for _, v1, _ in train])
-    xs = [math.log(v1) - ref for _, v1, _ in train]
-    x_min, x_max = min(xs), max(xs)
-    medians = []
-    slopes = []
-    sigmas = []
-    pooled_num = 0.0
-    pooled_den = 0.0
-    per_hour = []
-    for h in range(1, 24):
-        ratios = [math.log(series[h] / v1) for _, v1, series in train]
-        medians.append(_median(ratios))
-        mean_x = sum(xs) / len(xs)
-        mean_y = sum(ratios) / len(ratios)
-        num = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ratios))
-        den = sum((x - mean_x) ** 2 for x in xs)
-        slope = num / den if den > 0 else 0.0
-        slopes.append(slope)
-        per_hour.append((ratios, slope))
-        pooled_num += num
-        pooled_den += den
-    pooled = pooled_num / pooled_den if pooled_den > 0 else 0.0
-    if MEDIAN_SMOOTH:
-        medians = _smooth3(medians)
-    slopes = _smooth3(slopes)
-    slopes = [SLOPE_SHRINK * s + (1.0 - SLOPE_SHRINK) * pooled for s in slopes]
-    for h in range(1, 24):
-        ratios, _slope = per_hour[h - 1]
-        fitted = [medians[h - 1] + slopes[h - 1] * x for x in xs]
-        resid = sorted(r - f for r, f in zip(ratios, fitted))
-        iqr = _quantile(resid, 0.75) - _quantile(resid, 0.25)
-        sigma = max(SIGMA_FLOOR, iqr / 1.349) if iqr > 0 else SIGMA_FLOOR
-        sigmas.append(sigma)
-    sigmas = _smooth3(sigmas)
-    sigmas = [s * SIGMA_MULT for s in sigmas]
-    return {
-        "ref": ref, "x_min": x_min, "x_max": x_max,
-        "medians": medians, "slopes": slopes, "sigmas": sigmas,
-    }
-
-
-def _forecast_from_fit(p1, fit):
-    """The 23 rows of quantiles for hour-1 print p1 under a fitted model."""
-    x = math.log(p1) - fit["ref"]
-    x = min(max(x, fit["x_min"]), fit["x_max"])  # no extrapolation past the data
+def forecast(p1, train):
+    """23 baris x 5 kuantil untuk jam 2..24."""
+    p = max(float(p1), 1.0)
+    if len(train) < 3:
+        return starter(p)
+    xs = [math.log(max(t[0], 1.0)) for t in train]
+    rs = [[math.log(max(t[1][h], 1.0)) - math.log(max(t[1][0], 1.0))
+           for h in range(1, 24)] for t in train]
+    n = len(train)
+    xbar = _mean(xs)
+    x = math.log(p)
+    ybar = [_mean([rs[i][h] for i in range(n)]) for h in range(23)]
+    den = sum((v - xbar) ** 2 for v in xs)
+    raw_b = []
+    for h in range(23):
+        num = sum((xs[i] - xbar) * (rs[i][h] - ybar[h])
+                  for i in range(n))
+        raw_b.append(num / den if den > 1e-12 else 0.0)
+    # ratakan slope antar jam tetangga
+    b = []
+    for h in range(23):
+        lo = max(0, h - 1)
+        hi = min(22, h + 1)
+        b.append(_mean(raw_b[lo:hi + 1]))
+    # pusat + residual tiap game latih
+    med = []
+    resid = [[0.0] * 23 for _ in range(n)]
+    for h in range(23):
+        shift = b[h] * (x - xbar)
+        shift = max(-GUARD, min(GUARD, shift))
+        med.append(ybar[h] + shift)
+    for i in range(n):
+        for h in range(23):
+            shift = b[h] * (xs[i] - xbar)
+            shift = max(-GUARD, min(GUARD, shift))
+            resid[i][h] = rs[i][h] - (ybar[h] + shift)
+    # spread per jam
+    sig = []
+    for h in range(23):
+        col = sorted(resid[i][h] for i in range(n))
+        iqr = _quantile(col, 0.75) - _quantile(col, 0.25)
+        sig.append(max(FLOOR, MULT * iqr / 1.349))
     rows = []
-    for i, h in enumerate(HOURS):
-        centre = fit["medians"][i] + fit["slopes"][i] * x
-        sigma = fit["sigmas"][i]
-        quantiles = []
-        for z in Z:
-            value = p1 * math.exp(centre + z * sigma)
-            value = min(max(value, 1.0), 1e9)
-            quantiles.append(_round2(value))
-        # Rounding can only break monotonicity by a cent; enforce it.
-        for j in range(1, 5):
-            if quantiles[j] < quantiles[j - 1]:
-                quantiles[j] = quantiles[j - 1]
-        rows.append({"hour": h, "q": quantiles})
-    return {"hours": rows}
+    for h in range(23):
+        q = [p * math.exp(med[h] + z * sig[h]) for z in Z]
+        q = [min(max(v, 1.0), 1e9) for v in q]
+        for k in range(1, 5):
+            q[k] = max(q[k], q[k - 1])
+        rows.append(q)
+    return rows
 
 
-def _round2(value):
-    """Round to 2 decimals, half up; whole numbers come back as ints."""
-    scaled = value * 100.0
-    whole = math.floor(scaled)
-    if scaled - whole >= 0.5:
-        whole += 1
-    rounded = whole / 100.0
-    return int(rounded) if float(rounded).is_integer() else rounded
-
-
-def _persistence(p1):
-    """Flat fallback: every hour at the hour-1 print, widening spread."""
+def starter(p1):
+    p = max(float(p1), 1.0)
     rows = []
-    for h in HOURS:
-        quantiles = []
-        for z in Z:
-            value = min(max(p1 * math.exp(z * PERSIST_SIGMA * math.sqrt(h - 1)), 1.0), 1e9)
-            quantiles.append(_round2(value))
-        rows.append({"hour": h, "q": quantiles})
-    return {"hours": rows}
+    for h in range(2, 25):
+        s = 0.15 * math.sqrt(h - 1)
+        q = [p * math.exp(z * s) for z in Z]
+        q = [min(max(v, 1.0), 1e9) for v in q]
+        for k in range(1, 5):
+            q[k] = max(q[k], q[k - 1])
+        rows.append(q)
+    return rows
 
 
-def _hour1_print(case):
-    """Hour 1's print, with defensive fallbacks (never crash the case)."""
-    for row in case.get("known") or []:
-        if row.get("hour") == 1:
-            viewers = row.get("viewers")
-            if isinstance(viewers, (int, float)) and viewers > 0:
-                return float(viewers)
-    history = case.get("history_hourly") or []
-    if history:
-        viewers = history[-1].get("viewers")
-        if isinstance(viewers, (int, float)) and viewers > 0:
-            return float(viewers)
-    return 1.0
-
-
-def forecast_case(case):
-    """Forecast one case. Always returns a valid 23-row forecast."""
-    p1 = max(1.0, _hour1_print(case))
-    try:
-        console, every = _usable_comparables(case)
-        train = console if len(console) >= MIN_CONSOLE else every
-        if len(train) >= MIN_CONSOLE:
-            return _forecast_from_fit(p1, _fit(train))
-    except Exception:
-        pass  # any surprise in the fit must not void the case
-    return _persistence(p1)
+def run_case(case):
+    known = case.get("known") or []
+    p1 = 1.0
+    if known:
+        p1 = known[0].get("viewers") or 1.0
+    train = training_games(case)
+    rows = forecast(p1, train)
+    return {"hours": [{"hour": h + 2, "q": rows[h]} for h in range(23)]}
 
 
 def main():
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    for path in sorted(INPUT_DIR.glob("*.in")):
-        case = json.loads(path.read_text(encoding="utf-8"))
-        forecast = forecast_case(case)
-        (OUTPUT_DIR / f"{path.stem}.out").write_text(
-            json.dumps(forecast, separators=(",", ":")) + "\n", encoding="utf-8")
+    in_dir = os.environ.get("MAKEFUN_INPUT_DIR") or "/input"
+    out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR") or "/output"
+    os.makedirs(out_dir, exist_ok=True)
+    for path in sorted(glob.glob(os.path.join(in_dir, "*.in"))):
+        with open(path) as f:
+            case = json.load(f)
+        out = run_case(case)
+        base = os.path.splitext(os.path.basename(path))[0]
+        with open(os.path.join(out_dir, base + ".out"), "w") as f:
+            json.dump(out, f)
 
 
 if __name__ == "__main__":
